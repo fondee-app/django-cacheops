@@ -10,12 +10,18 @@ from .cross import pickle, md5
 
 import django
 from django.utils.encoding import smart_str, force_text
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, EmptyResultSet
 from django.db import DEFAULT_DB_ALIAS
 from django.db.models import Manager, Model
 from django.db.models.query import QuerySet
-from django.db.models.sql.datastructures import EmptyResultSet
 from django.db.models.signals import pre_save, post_save, post_delete, m2m_changed
+
+# This thing reappeared in Django 3.0
+try:
+    from django.db.models.query import MAX_GET_RESULTS
+    from django.db import connections
+except ImportError:
+    MAX_GET_RESULTS = None
 
 from .conf import model_profile, settings, ALL_OPS
 from .utils import monkey_mix, stamp_fields, func_cache_key, cached_view_fab, family_has_profile
@@ -25,7 +31,6 @@ from .tree import dnfs
 from .invalidation import invalidate_obj, invalidate_dict, no_invalidation
 from .transaction import transaction_states
 from .signals import cache_read
-
 
 __all__ = ('cached_as', 'cached_view_as', 'install_cacheops')
 
@@ -135,6 +140,7 @@ def cached_as(*samples, **kwargs):
                     return result
 
         return wrapper
+
     return decorator
 
 
@@ -158,7 +164,7 @@ class QuerySetMixin(object):
                 'Cacheops is not enabled for %s.%s model.\n'
                 'If you don\'t want to cache anything by default '
                 'you can configure it with empty ops.'
-                    % (self.model._meta.app_label, self.model._meta.model_name))
+                % (self.model._meta.app_label, self.model._meta.model_name))
 
     def _cache_key(self, prefix=True):
         """
@@ -209,9 +215,9 @@ class QuerySetMixin(object):
     def _should_cache(self, op):
         # If cache and op are enabled and not within write or dirty transaction
         return settings.CACHEOPS_ENABLED \
-            and self._cacheprofile and op in self._cacheprofile['ops'] \
-            and not self._for_write \
-            and not transaction_states[self.db].is_dirty()
+               and self._cacheprofile and op in self._cacheprofile['ops'] \
+               and not self._for_write \
+               and not transaction_states[self.db].is_dirty()
 
     def cache(self, ops=None, timeout=None, lock=None):
         """
@@ -283,6 +289,7 @@ class QuerySetMixin(object):
                 def query_clone():
                     self.query.clone = original_query_clone
                     return self.query
+
                 self.query.clone = query_clone
                 return self.clone(klass, setup, **kwargs)
             else:
@@ -363,8 +370,8 @@ class QuerySetMixin(object):
             #       - ...
             # TODO: don't distinguish between pk, pk__exaxt, id, id__exact
             # TOOD: work with .filter(**kwargs).get() ?
-            if self._cacheprofile['local_get']        \
-                    and not args                      \
+            if self._cacheprofile['local_get'] \
+                    and not args \
                     and not self.query.select_related \
                     and not self.query.where.children:
                 # NOTE: We use simpler way to generate a cache key to cut costs.
@@ -437,8 +444,10 @@ def connect_first(signal, receiver, sender):
     signal.connect(receiver, sender=sender, weak=False)
     signal.receivers += old_receivers
 
+
 # We need to stash old object before Model.save() to invalidate on its properties
 _old_objs = threading.local()
+
 
 class ManagerMixin(object):
     @once_per('cls')
@@ -510,6 +519,11 @@ class ManagerMixin(object):
             key = 'pk' if cache_on_save is True else cache_on_save
             cond = {key: getattr(instance, key)}
             qs = sender.objects.inplace().using(using).filter(**cond).order_by()
+            # Mimic Django 3.0 .get() logic
+            if MAX_GET_RESULTS and (
+                    not qs.query.select_for_update
+                    or connections[qs.db].features.supports_select_for_update_with_limit):
+                qs.query.set_limits(high=MAX_GET_RESULTS)
             qs._cache_results(qs._cache_key(), [instance])
 
             # Reverting stripped attributes
@@ -554,7 +568,7 @@ def invalidate_m2m(sender=None, instance=None, model=None, action=None, pk_set=N
     else:
         get_remote = lambda f: f.rel
     m2m = next(m2m for m2m in instance._meta.many_to_many + model._meta.many_to_many
-                   if get_remote(m2m).through == sender)
+               if get_remote(m2m).through == sender)
     instance_column, model_column = m2m.m2m_column_name(), m2m.m2m_reverse_name()
     if reverse:
         instance_column, model_column = model_column, instance_column
@@ -591,7 +605,7 @@ def install_cacheops():
             if not isinstance(model._default_manager, Manager):
                 raise ImproperlyConfigured("Can't install cacheops for %s.%s model:"
                                            " non-django model class or manager is used."
-                                            % (model._meta.app_label, model._meta.model_name))
+                                           % (model._meta.app_label, model._meta.model_name))
             model._default_manager._install_cacheops(model)
 
             # Bind m2m changed handlers
@@ -625,4 +639,5 @@ def install_cacheops():
 
         def Q__init__(self, *args, **kwargs):  # noqa
             super(Q, self).__init__(children=list(args) + list(sorted(kwargs.items())))
+
         Q.__init__ = Q__init__
